@@ -179,9 +179,9 @@
 (allow file-ioctl (regex "^/dev/ttys[0-9]+$"))
 
 ; Allow metadata traversal for firmlink parents.
-(allow file-read-metadata (literal "/System/Volumes") (vnode-type DIRECTORY))
-(allow file-read-metadata (literal "/System/Volumes/Data") (vnode-type DIRECTORY))
-(allow file-read-metadata (literal "/System/Volumes/Data/Users") (vnode-type DIRECTORY))
+(allow file-read-metadata (require-all (literal "/System/Volumes") (vnode-type DIRECTORY)))
+(allow file-read-metadata (require-all (literal "/System/Volumes/Data") (vnode-type DIRECTORY)))
+(allow file-read-metadata (require-all (literal "/System/Volumes/Data/Users") (vnode-type DIRECTORY)))
 
 ; App sandbox extensions
 (allow file-read* (extension "com.apple.app-sandbox.read"))

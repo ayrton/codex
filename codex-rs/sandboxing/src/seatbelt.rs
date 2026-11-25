@@ -432,6 +432,7 @@ fn build_seatbelt_access_policy(
 ) -> Result<(String, Vec<(String, PathBuf)>), SeatbeltPreparationError> {
     let mut policy_components = Vec::new();
     let mut root_anchor_denies = Vec::new();
+    let mut ancestor_reads = Vec::new();
     let mut params = Vec::new();
     let (action, param_prefix) = match access_kind {
         SeatbeltAccessKind::Read => ("file-read*", "READABLE_ROOT"),
@@ -457,6 +458,11 @@ fn build_seatbelt_access_policy(
         };
         let root_param = format!("{param_prefix}_{index}");
         params.push((root_param.clone(), root.clone().into_path_buf()));
+        if access_kind == SeatbeltAccessKind::Read && root.as_path().parent().is_some() {
+            ancestor_reads.push(format!(
+                "(allow file-read-metadata (path-ancestors (param \"{root_param}\")))"
+            ));
+        }
         if access_kind == SeatbeltAccessKind::Write {
             // A sandboxed process must not be able to replace an authority
             // boundary that will be reused to build the next sandbox policy.
@@ -526,6 +532,7 @@ fn build_seatbelt_access_policy(
             "(allow {action}\n{}\n)",
             policy_components.join(" ")
         )];
+        policies.extend(ancestor_reads);
         policies.extend(root_anchor_denies);
         Ok((policies.join("\n"), params))
     }
@@ -543,6 +550,41 @@ fn seatbelt_protected_metadata_name_regex(root: &AbsolutePathBuf, name: &str) ->
     } else {
         format!(r#"^{root}/{name}(/.*)?$"#)
     }
+}
+
+fn build_seatbelt_unreadable_metadata_policy(
+    unreadable_roots: &[AbsolutePathBuf],
+    readable_roots: &[AbsolutePathBuf],
+) -> (String, Vec<(String, PathBuf)>) {
+    let mut policies = Vec::new();
+    let mut params = Vec::new();
+    for (index, root) in unreadable_roots.iter().enumerate() {
+        let root = normalize_path_for_sandbox(root.as_path()).unwrap_or_else(|| root.clone());
+        let key = format!("UNREADABLE_METADATA_ROOT_{index}");
+        params.push((key.clone(), root.clone().into_path_buf()));
+        let mut filters = vec![format!(
+            "(require-any (literal (param \"{key}\")) (subpath (param \"{key}\")))"
+        )];
+        for (child_index, child) in readable_roots.iter().enumerate() {
+            let child =
+                normalize_path_for_sandbox(child.as_path()).unwrap_or_else(|| child.clone());
+            if child == root || !child.as_path().starts_with(root.as_path()) {
+                continue;
+            }
+            let child_key = format!("{key}_READABLE_{child_index}");
+            params.push((child_key.clone(), child.into_path_buf()));
+            filters.push(format!("(require-not (literal (param \"{child_key}\")))"));
+            filters.push(format!("(require-not (subpath (param \"{child_key}\")))"));
+            filters.push(format!(
+                "(require-not (path-ancestors (param \"{child_key}\")))"
+            ));
+        }
+        policies.push(format!(
+            "(deny file-read-metadata (require-all {}))",
+            filters.join(" ")
+        ));
+    }
+    (policies.join("\n"), params)
 }
 
 fn build_seatbelt_unreadable_glob_policy(unreadable_globs: &[String]) -> String {
@@ -578,6 +620,7 @@ fn build_seatbelt_unreadable_glob_policy(unreadable_globs: &[String]) -> String 
             }
             let regex = regex.replace('"', "\\\"");
             policy_components.push(format!(r#"(deny file-read* (regex #"{regex}"))"#));
+            policy_components.push(format!(r#"(deny file-read-metadata (regex #"{regex}"))"#));
             policy_components.push(format!(r#"(deny file-write* (regex #"{regex}"))"#));
             if global_literal_basename {
                 continue;
@@ -790,6 +833,10 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
             FileSystemPolicyProjection::PreserveMutableRoots,
         )
         .map_err(|err| SeatbeltPreparationError::FileSystem(err.to_string()))?;
+    let (deny_metadata_policy, deny_metadata_params) = build_seatbelt_unreadable_metadata_policy(
+        &resolved_filesystem_permissions.unreadable_roots,
+        &resolved_filesystem_permissions.readable_roots,
+    );
     let include_process_defaults = resolved_filesystem_permissions.include_platform_defaults
         && matches!(
             profile,
@@ -956,6 +1003,7 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
     }
     policy_sections.push("(deny mach-lookup (xpc-service-name-prefix \"\"))".to_string());
     policy_sections.push(deny_read_policy);
+    policy_sections.push(deny_metadata_policy);
     // Renaming an allowed ancestor relocates its protected descendants past
     // their pathname carveouts. Keep these denies last so no broader allowance
     // can reopen the unlink operation used by rename.
@@ -987,6 +1035,7 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
         file_read_dir_params,
         file_write_dir_params,
         protected_ancestor_params,
+        deny_metadata_params,
         unix_socket_dir_params(&proxy),
     ]
     .concat();
@@ -1006,6 +1055,10 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
 #[cfg(test)]
 #[path = "seatbelt_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "seatbelt_metadata_tests.rs"]
+mod metadata_tests;
 
 #[cfg(test)]
 #[path = "seatbelt_daemon_socket_tests.rs"]
